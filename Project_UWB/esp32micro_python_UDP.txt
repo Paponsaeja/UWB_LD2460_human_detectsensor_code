@@ -1,0 +1,203 @@
+import network
+import time
+import ujson
+import gc
+import machine
+from umqtt.simple import MQTTClient
+from machine import UART
+from ld2460_driver import LD2460  # คุณต้องมีไฟล์นี้
+import usocket
+
+# --- 🎯 ID ประจำตัวของ Node (ต้องแก้ไขสำหรับแต่ละ Node) ---
+MY_NODE_ID = "uwb20250001" 
+# -----------------------------------------------------------
+
+# --- 🌐 ข้อมูล Master AP (ต้องตรงกับ Master ESP32S3) ---
+MASTER_AP_SSID = "UWB_Master_AP"
+MASTER_AP_PASS = "12345678"
+# -----------------------------------------------------------
+
+CONFIG_FILE = "config.json"
+UDP_PORT = 8266
+
+def save_config(data):
+    """บันทึกข้อมูล config ลงในไฟล์ JSON"""
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            ujson.dump(data, f)
+        print("✅ Config saved:", data)
+    except Exception as e:
+        print(f"❌ Error saving config: {e}")
+
+def load_config():
+    """โหลดข้อมูล config จากไฟล์ JSON"""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return ujson.load(f)
+    except:
+        print("No config file found.")
+        return {}
+        
+def delete_config():
+    """ลบ config.json เพื่อกลับสู่ Configuration Mode"""
+    try:
+        import os
+        os.remove(CONFIG_FILE)
+        print("🗑️ Config deleted. Will enter Configuration Mode on reboot.")
+    except:
+        pass # ไฟล์อาจไม่มีอยู่แล้ว
+    
+def listen_udp():
+    """รอฟัง UDP broadcast อย่างไม่มีกำหนด (Blocking)"""
+    sock = usocket.socket(usocket.AF_INET, usocket.SOCK_DGRAM)
+    sock.bind(('', UDP_PORT))
+    
+    print(f"Listening for config on UDP port {UDP_PORT} indefinitely...")
+    
+    try:
+        data, addr = sock.recvfrom(512)
+        print("📡 Received config from", addr)
+        cfg = ujson.loads(data.decode())
+        save_config(cfg)
+        print("Config received. Rebooting in 3s...")
+        time.sleep(3)
+        machine.reset()
+    except Exception as e:
+        print(f"❌ Error during UDP receive: {e}")
+    finally:
+        sock.close()
+
+def connect_to_master_ap():
+    """เชื่อมต่อ Wi-Fi STA ไปยัง Master AP"""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    
+    print(f"Connecting to Master AP: {MASTER_AP_SSID}...")
+    wlan.connect(MASTER_AP_SSID, MASTER_AP_PASS)
+    
+    for i in range(20): # รอ 20 วินาที
+        if wlan.isconnected():
+            print(f"✅ Connected to Master AP. IP: {wlan.ifconfig()[0]}")
+            return True
+        time.sleep(1)
+        
+    print("❌ Failed to connect to Master AP.")
+    return False
+
+def connect_wifi(ssid, password):
+    """เชื่อมต่อ Wi-Fi เครือข่ายหลัก"""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    
+    wlan.connect(ssid, password)
+    print(f"Connecting to Main WiFi: {ssid}...")
+    
+    for _ in range(30):
+        if wlan.isconnected():
+            print("✅ Main WiFi Connected:", wlan.ifconfig())
+            return True
+        time.sleep(1)
+            
+    print("❌ Main WiFi connection failed.")
+    return False
+
+def connect_mqtt(cfg):
+    """เชื่อมต่อ MQTT Broker โดยใช้ MY_NODE_ID เป็น Client ID"""
+    try:
+        client = MQTTClient(
+            MY_NODE_ID, 
+            cfg.get("mqtt"), 
+            user=cfg.get("mqttuser"), 
+            password=cfg.get("mqttpass")
+        )
+        client.connect()
+        print("✅ Connected to MQTT Broker:", cfg.get("mqtt"))
+        return client
+    except Exception as e:
+        print(f"❌ MQTT connect fail: {e}")
+        return None
+
+def main():
+    print(f"--- UWB Node Initializing (ID: {MY_NODE_ID}) ---")
+
+    cfg = load_config()
+    
+    # 1. Configuration Mode: ถ้าไม่มี config ให้เชื่อม Master AP และรอ UDP
+    if not cfg or not cfg.get("ssid"):
+        print("No config found. Entering Configuration Mode.")
+        if connect_to_master_ap():
+            while True:
+                listen_udp() # Blocking, จะ Reboot เมื่อได้รับ Config
+        else:
+            print("Cannot connect to Master AP. Retrying in 30s...")
+            time.sleep(30)
+            machine.reset() # Reboot เพื่อลองใหม่
+
+    # 2. Operational Mode: มี config แล้ว พยายามเชื่อมต่อเครือข่ายหลัก
+    print("Starting Operational Mode...")
+    if not connect_wifi(cfg.get("ssid"), cfg.get("password")):
+        print("Main WiFi failed. Deleting config and rebooting to config mode.")
+        delete_config() # ลบ config เพื่อกลับไป config mode ในรอบหน้า
+        time.sleep(5)
+        machine.reset()
+
+    # 3. ตรวจสอบ ID
+    received_node_id = cfg.get("nodeid")
+    if received_node_id != MY_NODE_ID:
+        print(f"ID mismatch. My ID '{MY_NODE_ID}' != Active ID '{received_node_id}'.")
+        print("Entering Idle Mode, Listening for new UDP config.")
+        while True:
+            listen_udp() # Blocking, รอจนกว่าจะมีการเปลี่ยน Active ID
+
+    # --- 4. Node Active ---
+    print(f"ID Match! This node ({MY_NODE_ID}) is now ACTIVE.")
+
+    # 5. เชื่อมต่อ MQTT
+    client = connect_mqtt(cfg)
+    if not client:
+        print("MQTT connection failed. Deleting config and rebooting.")
+        delete_config()
+        time.sleep(5)
+        machine.reset()
+
+    # 6. Sensor & Main Loop (เหมือนเดิม)
+    # ... (ส่วนของ LD2460 Sensor และ While True loop)
+    print("Initializing LD2460 Sensor...")
+    try:
+        sensor = LD2460(uart_id=2, tx_pin=17, rx_pin=16, baudrate=115200)
+        sensor.calibrate()
+        sensor.set_install_mode(LD2460.MODE_SIDE_MOUNT)
+        sensor.set_detection_range(2.5, 50, 135)
+    except Exception as e:
+        print(f"Failed to initialize LD2460 sensor: {e}")
+        time.sleep(5)
+        machine.reset()
+        
+    print("Sensor init OK. Starting main loop...")
+    last_count = -1
+    while True:
+        try:
+            if sensor.read_data():
+                targets = sensor.get_targets()
+                count = len(targets)
+                if count != last_count:
+                    topic = f"uwb/{MY_NODE_ID}/count"
+                    msg = ujson.dumps({"people_count": count})
+                    client.publish(topic, msg)
+                    print(f"Published: {topic} = {count}")
+                    last_count = count
+            
+            time.sleep(0.3)
+            gc.collect()
+            
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            time.sleep(5)
+            client = connect_mqtt(cfg)
+            if not client:
+                print("MQTT reconnect failed. Rebooting...")
+                time.sleep(5)
+                machine.reset()
+
+# เริ่มการทำงาน
+main()

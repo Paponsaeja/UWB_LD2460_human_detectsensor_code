@@ -1,0 +1,120 @@
+current_count = 0  # เก็บค่าล่าสุดของ sensor
+
+def on_message(topic, msg):
+    global current_count
+    try:
+        topic = topic.decode() if isinstance(topic, bytes) else topic
+        msg = msg.decode() if isinstance(msg, bytes) else msg
+        print(f"[MQTT] Message on {topic}: {msg}")
+
+        if msg == NODE_ID:
+            print(f"[MQTT] Matched NODE_ID '{NODE_ID}' → Publish count once.")
+            payload = ujson.dumps(current_count)
+            if client:
+                safe_publish(client, mqtt_topic, payload, config)
+                print("Sent on request:", payload)
+    except Exception as e:
+        print("on_message error:", e)
+        
+
+def safe_publish(client, topic, message, config, retries=3):
+    global client  # สำคัญ!
+    for attempt in range(retries):
+        try:
+            client.publish(topic, message, retain=True)
+            return True
+        except Exception as e:
+            print(f"Publish failed (attempt {attempt+1}/{retries}):", e)
+            time.sleep(2)
+            client = connect_mqtt(config)  # ← up-level reconnect
+    return False
+
+
+def handle_mqtt_error(e, config):
+    global client
+    if hasattr(e, "args") and len(e.args) > 0:
+        code = e.args[0]
+    else:
+        code = None
+
+    if code in (-1, 104, 128):  # ← เพิ่ม 128
+        print(f"MQTT connection lost (error {code}) — trying to reconnect...")
+        try:
+            client = connect_mqtt(config)
+            if client:
+                client.set_callback(on_message)
+                client.subscribe("uwb/")
+                print("MQTT reconnected & re-subscribed")
+                return True
+        except Exception as err:
+            print("Reconnect failed:", err)
+        time.sleep(5)
+        return False
+
+    else:
+        print("Unhandled MQTT error:", e)
+        return False
+
+
+# -------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    print("\n=== LD2460 + MQTT Publisher (Captive Portal) ===")
+    config = load_config()
+
+    # ถ้ายังไม่มี config → เปิด config portal
+    if not config.get("ssid"):
+        start_config_portal()
+
+    # ถ้าเชื่อม WiFi ไม่ได้ → เปิด portal ใหม่
+    if not connect_wifi(config["ssid"], config["password"]):
+        start_config_portal()
+
+    # ถ้าชื่อตรง → เริ่มทำงาน publish ได้
+    client_id = config.get("mqtt_client_id", "")
+    client = connect_mqtt(config)
+    mqtt_topic = f"uwb/{client_id}/count"
+    print("Using topic:", mqtt_topic)
+
+    try:
+        sensor = LD2460(uart_id=2, tx_pin=17, rx_pin=16, baudrate=115200)
+        sensor.calibrate()
+        sensor.set_install_mode(LD2460.MODE_SIDE_MOUNT)
+        sensor.set_detection_range(4, 30, 150)
+    except Exception as e:
+        print("LD2460 init failed:", e)
+        machine.reset()
+
+    published_once = False
+    last_count = -1
+    
+
+    # subscribe topic NODE_ID
+    sub_topic = f"uwb/"
+    client.set_callback(on_message)
+    client.subscribe(sub_topic)
+    print(f"Subscribed to topic: {sub_topic}")
+
+    while True:
+        try:
+            # อ่าน sensor ตลอดเวลา
+            if sensor.read_data():
+                count = len(sensor.get_targets())
+                if count != last_count:
+                    print(f"[Sensor] Count: {count}")
+                    last_count = count
+                    current_count = count  # update ค่าล่าสุด
+
+            client.check_msg()  # ไม่ block
+            gc.collect()
+            time.sleep(0.5)
+            
+        except (OSError, Exception) as e:
+            handle_mqtt_error(e, config)
+            continue
+
+        except Exception as e:
+            print("Error:", e)
+            gc.collect()
+            time.sleep(2)
